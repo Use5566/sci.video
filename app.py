@@ -30,7 +30,7 @@ def upload_to_drive(file_obj, file_name):
         media = MediaIoBaseUpload(io.BytesIO(file_obj.read()), mimetype=file_obj.type, resumable=True)
         
         # 執行上傳
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        file = service.files().create(body=file_metadata, media_body=media, fields='id',supportsAllDrives=True).execute()
         return file.get('id')
     except Exception as e:
         st.error(f"上傳發生錯誤：{e}")
