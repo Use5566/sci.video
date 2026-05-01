@@ -1,88 +1,82 @@
 import streamlit as st
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2 import service_account
+import io
 
 # 1. 網頁基本設定
 st.set_page_config(page_title="科學實驗影片上傳", page_icon="🔬", layout="centered")
 st.title("🔬 科學實驗影片上傳系統")
 
 # 2. 安全密碼鎖 (透過 secrets 保護)
-# 使用 st.secrets.get() 可以避免本機還沒設定時直接當機。
-# 正式上線前，請在 Streamlit Cloud 後台設定 app_password = "您的真實密碼"
 correct_password = st.secrets.get("app_password", "science")
-
 password = st.text_input("請輸入通關密碼以解鎖上傳區：", type="password")
 
+# --- Google Drive 上傳函數 ---
+def upload_to_drive(file_obj, file_name):
+    try:
+        # 從 Secrets 讀取 Google 服務帳戶資訊
+        creds_dict = st.secrets["gcp_service_account"]
+        creds = service_account.Credentials.from_service_account_info(creds_dict)
+        service = build('drive', 'v3', credentials=creds)
+
+        # 設定檔案元數據 (Metadata)
+        file_metadata = {
+            'name': file_name,
+            'parents': [st.secrets["drive_folder_id"]] # 雲端硬碟資料夾 ID
+        }
+        
+        # 準備檔案內容
+        media = MediaIoBaseUpload(io.BytesIO(file_obj.read()), mimetype=file_obj.type, resumable=True)
+        
+        # 執行上傳
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return file.get('id')
+    except Exception as e:
+        st.error(f"上傳發生錯誤：{e}")
+        return None
+
 if password == correct_password:
-    st.success("密碼正確！請填寫以下上傳資訊：")
-    st.divider() 
-    
-    # --- 欄位 1：年級 (3-6) ---
+    # --- 欄位設計 (與之前相同) ---
     grade = st.radio("選擇年級：", ["3年級", "4年級", "5年級", "6年級"], horizontal=True)
-    
-    # --- 欄位 2：班級 (1-5) ---
     room = st.radio("選擇班級：", ["1班", "2班", "3班", "4班", "5班"], horizontal=True)
     
     st.divider()
+    st.write("選擇座號（最多 4 位）：")
+    if 'selected_seats' not in st.session_state: st.session_state.selected_seats = []
     
-    # --- 欄位 3：座號 (1-34，最多複選 4 位) ---
-    st.write("選擇座號（小組成員，最多可選 4 位）：")
-    
-    # 使用 session_state 儲存一個「清單」來記錄已選擇的座號
-    if 'selected_seats' not in st.session_state:
-        st.session_state.selected_seats = []
-        
     cols = st.columns(6)
     for i in range(1, 35):
-        col_idx = (i - 1) % 6
-        # 檢查該座號是否已經被選取
         is_selected = i in st.session_state.selected_seats
-        
-        # 如果被選中，按鈕顏色變深 (primary)，否則為淺色 (secondary)
-        btn_type = "primary" if is_selected else "secondary"
-        
-        with cols[col_idx]:
-            # 按鈕被按下時的觸發邏輯
-            if st.button(f"{i:02d}號", key=f"seat_{i}", type=btn_type, use_container_width=True):
-                if is_selected:
-                    # 如果已經選了，再次點擊就是取消選擇
-                    st.session_state.selected_seats.remove(i)
-                    st.rerun() # 重新整理頁面以更新按鈕顏色
-                else:
-                    # 如果還沒選，檢查是否已經選滿 4 人
-                    if len(st.session_state.selected_seats) < 4:
-                        st.session_state.selected_seats.append(i)
-                        st.rerun()
-                    else:
-                        st.error("⚠️ 最多只能選擇 4 位座號喔！")
-                        
-    # 顯示目前選到的座號，將數字排序並格式化
+        if cols[(i-1)%6].button(f"{i:02d}號", key=f"s{i}", type="primary" if is_selected else "secondary", use_container_width=True):
+            if is_selected: st.session_state.selected_seats.remove(i)
+            elif len(st.session_state.selected_seats) < 4: st.session_state.selected_seats.append(i)
+            st.rerun()
+            
     if st.session_state.selected_seats:
         sorted_seats = sorted(st.session_state.selected_seats)
-        seats_str = "、".join([f"{s:02d}號" for s in sorted_seats])
-        st.info(f"👉 目前已選擇的座號：**{seats_str}**")
-    else:
-        st.info("👉 尚未選擇座號")
+        st.info(f"👉 已選座號：**{'、'.join([f'{s:02d}號' for s in sorted_seats])}**")
 
-    st.divider()
-
-    # --- 欄位 4：實驗主題 ---
     topic = st.text_input("實驗主題：")
-    
-    # --- 欄位 5：上傳檔案 ---
     uploaded_file = st.file_uploader("上傳實驗影片檔", type=["mp4", "mov", "avi"])
-    
-    # --- 確認按鈕與防呆機制 ---
-    if st.button("確認上傳", type="primary"):
-        if len(st.session_state.selected_seats) == 0:
-            st.error("⚠️ 請至少選擇一位座號！")
-        elif not topic:
-            st.error("⚠️ 請填寫實驗主題！")
-        elif not uploaded_file:
-            st.error("⚠️ 請上傳影片檔案！")
+
+    # --- 確認上傳按鈕 ---
+    if st.button("🚀 開始上傳到雲端", type="primary"):
+        if not st.session_state.selected_seats or not topic or not uploaded_file:
+            st.warning("⚠️ 請檢查座號、主題與檔案是否都填好了？")
         else:
-            # 組合檔名：把多個座號串起來 (例如：01_05_12)
-            seats_for_filename = "_".join([f"{s:02d}" for s in sorted(st.session_state.selected_seats)])
-            file_name = f"{grade}_{room}_{seats_for_filename}號_{topic}.mp4"
-            st.success(f"✅ 資料確認無誤！\n\n未來在 Google Drive 的自動命名將會是：\n**{file_name}**")
+            with st.spinner("影片正在上傳中，請勿關閉視窗..."):
+                seats_str = "_".join([f"{s:02d}" for s in sorted(st.session_state.selected_seats)])
+                # 根據您的需求自動命名
+                final_name = f"{grade}_{room}_{seats_str}號_{topic}.mp4"
+                
+                file_id = upload_to_drive(uploaded_file, final_name)
+                
+                if file_id:
+                    st.success(f"✅ 上傳成功！檔名為：{final_name}")
+                    st.balloons()
+                    # 上傳成功後清空選擇，方便下一位學生
+                    st.session_state.selected_seats = []
 
 elif password != "":
-    st.error("密碼錯誤，請重新輸入。")
+    st.error("密碼錯誤。")
