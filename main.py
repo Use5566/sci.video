@@ -1,77 +1,99 @@
+import sys
 import os
-import io
 import json
-import shutil
-import tempfile
+
+# =====================================================================
+# 1. 獨立子程序（Worker）：專門執行 Google API 上傳，傳完立即終止並由 OS 釋放 RAM
+# =====================================================================
+def run_worker(task_file: str):
+    try:
+        with open(task_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        file_path = data["file_path"]
+        final_name = data["final_name"]
+        mime_type = data["mime_type"]
+        row_data = data["row_data"]
+
+        gcp_sa = os.environ.get("GCP_SERVICE_ACCOUNT")
+        drive_folder_id = os.environ.get("DRIVE_FOLDER_ID")
+        spreadsheet_id = os.environ.get("SPREADSHEET_ID")
+
+        if not gcp_sa or not drive_folder_id or not spreadsheet_id:
+            sys.stderr.write("Worker: 缺少必要的環境變數\n")
+            sys.exit(1)
+
+        # 僅在子程序內部載入龐大的 Google API Client
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+        from google.oauth2 import service_account
+
+        creds_dict = json.loads(gcp_sa)
+        scopes = [
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/spreadsheets'
+        ]
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+        # 1. 串流上傳至 Google Drive
+        drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        file_metadata = {
+            'name': final_name,
+            'parents': [drive_folder_id]
+        }
+        media = MediaFileUpload(
+            file_path,
+            mimetype=mime_type or "application/octet-stream",
+            chunksize=5 * 1024 * 1024,
+            resumable=True
+        )
+        request = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True
+        )
+        response = None
+        while response is None:
+            status_code, response = request.next_chunk()
+
+        file_id = response.get('id') if response else None
+        if not file_id:
+            sys.stderr.write("Worker: Google Drive 上傳失敗，未取得 file_id\n")
+            sys.exit(1)
+
+        # 2. 寫入 Google Sheets (對齊 A:F)
+        sheets_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
+        body = {'values': [row_data]}
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="A:F",
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+
+        # 順利完成退出，OS 將立刻回收此子程序的所有記憶體
+        sys.exit(0)
+
+    except Exception as e:
+        sys.stderr.write(f"Worker Error: {str(e)}\n")
+        sys.exit(1)
+
+# 如果是 Worker 呼叫，直接執行任務後結束，不啟動 Web 伺服器
+if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+    run_worker(sys.argv[2])
+
+
+# =====================================================================
+# 2. 主 Web 伺服器：僅負責網頁呈現、檔案接收與排隊，記憶體極低且平穩
+# =====================================================================
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List
-
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
 
 app = FastAPI(title="科學實驗影音上傳系統")
-
-# 全域排隊鎖：確保向 Google Drive 傳輸時一次只處理一件，防止記憶體與連線過載
 upload_lock = asyncio.Lock()
-
-SCOPES = [
-    'https://www.googleapis.com/auth/drive',
-    'https://www.googleapis.com/auth/spreadsheets'
-]
-
-# --- Google API 驗證與操作函數 ---
-def get_gcp_credentials():
-    sa_json = os.environ.get("GCP_SERVICE_ACCOUNT")
-    if not sa_json:
-        return None
-    try:
-        creds_dict = json.loads(sa_json)
-        return service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    except Exception as e:
-        print(f"GCP 憑證解析失敗: {e}")
-        return None
-
-def sync_drive_upload(creds, file_path: str, file_name: str, folder_id: str, mime_type: str) -> str:
-    """從硬碟路徑串流上傳至 Google Drive，不載入 RAM"""
-    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-    file_metadata = {
-        'name': file_name,
-        'parents': [folder_id]
-    }
-    media = MediaFileUpload(
-        file_path,
-        mimetype=mime_type or "application/octet-stream",
-        chunksize=5 * 1024 * 1024,
-        resumable=True
-    )
-    request = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id',
-        supportsAllDrives=True
-    )
-    response = None
-    while response is None:
-        status_code, response = request.next_chunk()
-    return response.get('id')
-
-def sync_sheet_append(creds, sheet_id: str, row_data: list) -> bool:
-    """寫入試算表 A:F 欄位"""
-    service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
-    body = {'values': [row_data]}
-    service.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range="A:F",
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-    return True
-
-# --- API 端點 ---
 
 @app.post("/api/verify-password")
 async def verify_password(payload: dict):
@@ -85,7 +107,7 @@ async def handle_upload(
     password: str = Form(...),
     grade: str = Form(...),
     room: str = Form(...),
-    seats: str = Form(...),  # 格式如："1,7,13"
+    seats: str = Form(...),
     topic: str = Form(...),
     result_text: str = Form(...),
     file: UploadFile = File(...)
@@ -94,14 +116,6 @@ async def handle_upload(
     if password != correct_password:
         raise HTTPException(status_code=401, detail="密碼驗證失敗")
 
-    drive_folder_id = os.environ.get("DRIVE_FOLDER_ID")
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
-    creds = get_gcp_credentials()
-
-    if not creds or not drive_folder_id or not spreadsheet_id:
-        raise HTTPException(status_code=500, detail="伺服器環境變數未配置完整")
-
-    # 1. 解析座號格式
     try:
         seat_list = [int(s.strip()) for s in seats.split(",") if s.strip()]
         seat_list = sorted(list(set(seat_list)))[:4]
@@ -113,7 +127,6 @@ async def handle_upload(
     seats_dot_str = ".".join([f"{s:02d}" for s in seat_list])
     seats_compact_str = "".join([f"{s:02d}" for s in seat_list])
 
-    # 2. 班級與時間格式化
     grade_num = grade.replace("年級", "").strip()
     room_num = room.replace("班", "").strip().zfill(2)
     class_str = f"{grade_num}{room_num}"
@@ -126,24 +139,22 @@ async def handle_upload(
     ext = file.filename.split('.')[-1] if '.' in file.filename else "mp4"
     final_name = f"{file_time_str}_{class_str}_{seats_compact_str}_{topic[:10]}_{result_text[:20]}.{ext}"
 
-    # 3. 分塊儲存至磁碟暫存檔（控制 RAM 消耗在 1MB 以內）
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp_path = tmp.name
-        shutil.copyfileobj(file.file, tmp)
+    dest_path = f"/tmp/{file_time_str}_{final_name}"
+    task_file = f"/tmp/task_{file_time_str}.json"
 
-    # 4. 進入排隊鎖，依序推送到雲端
     try:
-        async with upload_lock:
-            # 串流至 Google Drive
-            file_id = await asyncio.to_thread(
-                sync_drive_upload,
-                creds, tmp_path, final_name, drive_folder_id, file.content_type
-            )
-            if not file_id:
-                raise HTTPException(status_code=500, detail="Google Drive 上傳失敗")
+        # 以 1MB 分塊方式將上傳資料寫入硬碟暫存，完全不佔 RAM
+        with open(dest_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                buffer.write(chunk)
+        await file.close()
 
-            # 寫入 Google Sheets (欄位對齊 A:F)
-            row_data = [
+        # 封裝任務資訊
+        task_data = {
+            "file_path": dest_path,
+            "final_name": final_name,
+            "mime_type": file.content_type or "application/octet-stream",
+            "row_data": [
                 upload_time,
                 class_str,
                 seats_dot_str,
@@ -151,16 +162,41 @@ async def handle_upload(
                 result_text[:20],
                 final_name
             ]
-            await asyncio.to_thread(sync_sheet_append, creds, spreadsheet_id, row_data)
+        }
+        with open(task_file, "w", encoding="utf-8") as f:
+            json.dump(task_data, f, ensure_ascii=False)
+
+        # 排隊機制：依序喚醒獨立子程序推送資料
+        async with upload_lock:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                os.path.abspath(__file__),
+                "--worker",
+                task_file,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err_detail = stderr.decode('utf-8', errors='ignore').strip()
+                raise HTTPException(status_code=500, detail=f"雲端傳輸失敗：{err_detail}")
 
         return {"success": True, "filename": final_name}
 
     finally:
-        # 強制清理磁碟空間
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # 強制清理暫存檔
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+        if os.path.exists(task_file):
+            try:
+                os.remove(task_file)
+            except Exception:
+                pass
 
-# --- 前端網頁介面 (針對平板觸控最佳化) ---
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
     return """
@@ -173,7 +209,6 @@ async def serve_ui():
   <style>
     :root {
       --primary: #2563eb;
-      --primary-hover: #1d4ed8;
       --bg: #f8fafc;
       --card-bg: #ffffff;
       --text: #1e293b;
@@ -205,10 +240,7 @@ async def serve_ui():
       width: 100%; padding: 12px; background: var(--primary); color: #fff; border: none;
       border-radius: 8px; font-size: 1.1rem; font-weight: bold; cursor: pointer; margin-top: 10px;
     }
-    button.submit-btn:disabled { background: #94a3b8; cursor: not-allowed; }
-    .alert { padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 0.9rem; }
-    .alert-error { background: #fee2e2; color: #991b1b; }
-    .alert-success { background: #dcfce7; color: #166534; }
+    .alert-error { background: #fee2e2; color: #991b1b; padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 0.9rem; }
     .loading-overlay {
       position: fixed; top: 0; left: 0; width: 100%; height: 100%;
       background: rgba(255,255,255,0.9); display: flex; flex-direction: column;
@@ -226,20 +258,16 @@ async def serve_ui():
 <div class="card">
   <h1>🔬 科學實驗影音上傳系統</h1>
 
-  <!-- 密碼解鎖區 -->
   <div id="lock-section">
     <div class="form-group">
       <label>請輸入通關密碼：</label>
       <input type="password" id="app-password" placeholder="請輸入密碼">
     </div>
-    <div id="password-error" class="alert alert-error hidden">密碼錯誤。</div>
+    <div id="password-error" class="alert-error hidden">密碼錯誤。</div>
     <button class="submit-btn" onclick="verifyPassword()">驗證解鎖</button>
   </div>
 
-  <!-- 上傳介面區 -->
   <div id="upload-section" class="hidden">
-    <div id="status-box"></div>
-
     <div class="form-group">
       <label>選擇年級：</label>
       <div class="radio-group" id="grade-group">
@@ -297,7 +325,6 @@ async def serve_ui():
   let selectedRoom = "1班";
   let selectedSeats = [];
 
-  // 生成 1~34 號座號按鈕
   const seatGrid = document.getElementById("seat-grid");
   for (let i = 1; i <= 34; i++) {
     const btn = document.createElement("div");
@@ -356,7 +383,7 @@ async def serve_ui():
       return;
     }
 
-    if (file.size > 104857600) { // 100MB
+    if (file.size > 104857600) {
       alert("⚠️ 檔案超過 100MB 限制，請壓縮後再行上傳！");
       return;
     }
@@ -381,7 +408,6 @@ async def serve_ui():
       const data = await res.json();
       if (res.ok && data.success) {
         alert("✅ 上傳與記錄成功！\\n檔案名稱：" + data.filename);
-        // 清空表單
         document.getElementById("topic").value = "";
         document.getElementById("result-text").value = "";
         fileInput.value = "";
